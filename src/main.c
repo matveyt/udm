@@ -1,6 +1,6 @@
 /*
  * Custom firmware for Range Finder DIY kit
- * Last Change:  2025 Jul 09
+ * Last Change:  2025 Jul 10
  * License:      https://unlicense.org
  * URL:          https://github.com/matveyt/udm
  *
@@ -12,12 +12,8 @@
 
 #include <stc12.h>                      // STC89/90 < STC12 < STC15 < STC8
 #include <stdint.h>
-#include <stdnoreturn.h>
 #include "config.h"
 
-
-// 8051 bit type
-typedef __bit bit;
 
 static volatile int_fast8_t echo_status = 0;    // 0 not ready, 1 ok, -1 error
 static volatile uint_fast16_t echo_count0;      // ticks while ECHO==0
@@ -29,14 +25,16 @@ static volatile uint_fast8_t distance_cm = 0;
 // setup fast counter (Timer0 8-bit)
 inline void set_fast_counter(void)
 {
-    const uint8_t fast_counter = (uint8_t)(-CPU_FREQ * TICK_LEN / 12000);
+    const uint8_t fast_counter = (uint8_t)(-CPU_FREQ * TICK_LEN / 12 / 1000);
+    const uint8_t us10_counter = (uint8_t)(-CPU_FREQ * 10 / 12 / 1000);
     TH0 = fast_counter;
+    TL0 = us10_counter - 1;
 }
 
 // setup slow counter (Timer1 16-bit)
 inline void set_slow_counter(void)
 {
-    const uint16_t slow_counter = (uint16_t)(-CPU_FREQ * TICKUI_LEN / 12000);
+    const uint16_t slow_counter = (uint16_t)(-CPU_FREQ * TICKUI_LEN / 12 / 1000);
     TH1 = (uint8_t)(slow_counter >> 8);
     TL1 = (uint8_t)(slow_counter);
 }
@@ -45,17 +43,17 @@ inline void set_slow_counter(void)
 static void update_leds(void)
 {
 #if HAVE_LEDS
-    uint_fast8_t level = distance_m ? 99 : distance_cm;
+    uint_fast8_t level = distance_m ? 100 : distance_cm;
 
-    LED1 = (level > LEVEL1);    // inverse logic
-    LED2 = (level > LEVEL2);
-    LED3 = (level > LEVEL3);
-    LED4 = (level > LEVEL4);
-    LED5 = (level > LEVEL5);
-    LED6 = (level > LEVEL6);
-    LED7 = (level > LEVEL7);
-    LED8 = (level > LEVEL8);
-    LED9 = (level > LEVEL9);
+    LED1 = (level > LEVEL1) ? 1 : 0;    // inverse logic
+    LED2 = (level > LEVEL2) ? 1 : 0;
+    LED3 = (level > LEVEL3) ? 1 : 0;
+    LED4 = (level > LEVEL4) ? 1 : 0;
+    LED5 = (level > LEVEL5) ? 1 : 0;
+    LED6 = (level > LEVEL6) ? 1 : 0;
+    LED7 = (level > LEVEL7) ? 1 : 0;
+    LED8 = (level > LEVEL8) ? 1 : 0;
+    LED9 = (level > LEVEL9) ? 1 : 0;
 #endif // HAVE_LEDS
 }
 
@@ -76,9 +74,8 @@ static void update_display(void)
         0b10011000, // 9
     };
     static uint_fast8_t current_digit = 0;
-
-    bit err = (distance_m > 9 || distance_cm > 99
-        || (distance_m == 0 && distance_cm == 0));
+    uint_fast8_t err = (distance_m >= 10 || distance_cm >= 100
+        || (distance_m == 0 && distance_cm == 0)) ? 1 : 0;
 
     switch (current_digit) {
     case 0:
@@ -106,18 +103,12 @@ static void update_display(void)
 // calc (distance_m, distance_cm) from ticks
 static void calc_distance(uint_fast16_t ticks)
 {
-    static bit rounding_up = 0;
-
     uint_fast16_t t = ticks * (TICK_LEN / 2);
     uint_fast16_t mm = t * SPEED_OF_SOUND / 100000;
     uint_fast16_t cm = mm / 10;
 
-    // rounding with small hysteresis
-    mm %= 10;
-    rounding_up = (mm < 4) ? 0 : (mm > 5) ? 1 : rounding_up;
-
     distance_m = cm / 100;
-    distance_cm = (cm % 100) + rounding_up;
+    distance_cm = (cm % 100) + ((mm % 10 >= 5) ? 1 : 0);
 }
 
 // fast tick timer (polling ECHO pin)
@@ -125,8 +116,8 @@ INTERRUPT(static isr_tick, TF0_VECTOR)
 {
     if (ECHO) {
         ++echo_count1;
-        if (echo_count1 >= ECHO_MAX1 / TICK_LEN) {
-            // ECHO too long
+        if (echo_count1 > ECHO_MAX1 / TICK_LEN) {
+            // ECHO lost
             echo_status = -1;
             TR0 = 0;
         }
@@ -141,7 +132,7 @@ INTERRUPT(static isr_tick, TF0_VECTOR)
     }
 
     ++echo_count0;
-    if (echo_count0 >= ECHO_MAX0 / TICK_LEN) {
+    if (echo_count0 > 1 + ECHO_MAX0 / TICK_LEN) {
         // no ECHO
         echo_status = -1;
         TR0 = 0;
@@ -153,17 +144,17 @@ INTERRUPT(static isr_tick, TF0_VECTOR)
 INTERRUPT(static isr_tickui, TF1_VECTOR)
 {
     static uint_fast8_t tickui = 0;
-    static uint_fast8_t echo_errors = 0;
+    static uint_fast8_t echo_lost = 0;
 
     if (echo_status > 0) {
         // ECHO success
         calc_distance(echo_count1);
         update_leds();
-        echo_errors = 0;
+        echo_lost = 0;
         echo_status = 0;
     } else if (echo_status < 0) {
         // ECHO lost for more than 1 second
-        if (++echo_errors > 1000000 / TICKUI_LEN / ECHO_RATE) {
+        if (++echo_lost > 1000000 / TICKUI_LEN / ECHO_RATE) {
             distance_m = 10;
             update_leds();
         }
@@ -188,6 +179,7 @@ INTERRUPT(static isr_tickui, TF1_VECTOR)
             BUZZ = 1;
         }
     } else {
+        // make sure buzzer is off
         BUZZ = 1;
     }
 #endif // HAVE_BUZZER
@@ -196,7 +188,7 @@ INTERRUPT(static isr_tickui, TF1_VECTOR)
     if ((tickui & ECHO_RATE - 1) == 0 && TR0 == 0 && ECHO == 0) {
         TRIG = 1;
         echo_count0 = echo_count1 = 0;
-        for (TR0 = 1; echo_count0 == 0; ) ;  // wait 1xTICK_LEN
+        for (TR0 = 1; echo_count0 == 0; ) ;  // wait 10 us (fast timer's 1st tick)
         TRIG = 0;
     }
 
@@ -206,7 +198,7 @@ INTERRUPT(static isr_tickui, TF1_VECTOR)
 #endif // !HAVE_MODE0
 }
 
-noreturn void main(void)
+/*noreturn*/ void main(void)
 {
     // setup GPIO
     P0 = P1 = P2 = P3 = 0xFF;
